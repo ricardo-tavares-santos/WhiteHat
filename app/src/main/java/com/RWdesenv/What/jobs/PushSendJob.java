@@ -1,0 +1,348 @@
+package com.RWdesenv.What.jobs;
+
+import android.content.Context;
+import android.graphics.Bitmap;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import android.text.TextUtils;
+
+import com.annimon.stream.Stream;
+
+import org.greenrobot.eventbus.EventBus;
+import org.signal.libsignal.metadata.certificate.InvalidCertificateException;
+import org.signal.libsignal.metadata.certificate.SenderCertificate;
+import com.RWdesenv.What.TextSecureExpiredException;
+import com.RWdesenv.What.attachments.Attachment;
+import com.RWdesenv.What.attachments.DatabaseAttachment;
+import com.RWdesenv.What.blurhash.BlurHash;
+import com.RWdesenv.What.contactshare.Contact;
+import com.RWdesenv.What.contactshare.ContactModelMapper;
+import com.RWdesenv.What.crypto.ProfileKeyUtil;
+import com.RWdesenv.What.database.DatabaseFactory;
+import com.RWdesenv.What.dependencies.ApplicationDependencies;
+import com.RWdesenv.What.events.PartProgressEvent;
+import com.RWdesenv.What.jobmanager.Job;
+import com.RWdesenv.What.jobmanager.JobManager;
+import com.RWdesenv.What.jobmanager.impl.NetworkConstraint;
+import com.RWdesenv.What.linkpreview.LinkPreview;
+import com.RWdesenv.What.logging.Log;
+import com.RWdesenv.What.mms.DecryptableStreamUriLoader;
+import com.RWdesenv.What.mms.OutgoingMediaMessage;
+import com.RWdesenv.What.mms.PartAuthority;
+import com.RWdesenv.What.notifications.MessageNotifier;
+import com.RWdesenv.What.recipients.Recipient;
+import com.RWdesenv.What.recipients.RecipientId;
+import com.RWdesenv.What.recipients.RecipientUtil;
+import com.RWdesenv.What.util.Base64;
+import com.RWdesenv.What.util.BitmapDecodingException;
+import com.RWdesenv.What.util.BitmapUtil;
+import com.RWdesenv.What.util.Hex;
+import com.RWdesenv.What.util.MediaUtil;
+import com.RWdesenv.What.util.TextSecurePreferences;
+import com.RWdesenv.What.util.Util;
+import org.whispersystems.libsignal.util.guava.Optional;
+import org.whispersystems.signalservice.api.crypto.UnidentifiedAccessPair;
+import org.whispersystems.signalservice.api.messages.SignalServiceAttachment;
+import org.whispersystems.signalservice.api.messages.SignalServiceAttachmentPointer;
+import org.whispersystems.signalservice.api.messages.SignalServiceDataMessage;
+import org.whispersystems.signalservice.api.messages.SignalServiceDataMessage.Preview;
+import org.whispersystems.signalservice.api.messages.multidevice.SentTranscriptMessage;
+import org.whispersystems.signalservice.api.messages.multidevice.SignalServiceSyncMessage;
+import org.whispersystems.signalservice.api.messages.shared.SharedContact;
+import org.whispersystems.signalservice.api.push.SignalServiceAddress;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Collections;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+public abstract class PushSendJob extends SendJob {
+
+  private static final String TAG                           = PushSendJob.class.getSimpleName();
+  private static final long   CERTIFICATE_EXPIRATION_BUFFER = TimeUnit.DAYS.toMillis(1);
+
+  protected PushSendJob(Job.Parameters parameters) {
+    super(parameters);
+  }
+
+  protected static Job.Parameters constructParameters(@NonNull Recipient recipient) {
+    return new Parameters.Builder()
+                         .setQueue(recipient.getId().toQueueKey())
+                         .addConstraint(NetworkConstraint.KEY)
+                         .setLifespan(TimeUnit.DAYS.toMillis(1))
+                         .setMaxAttempts(Parameters.UNLIMITED)
+                         .build();
+  }
+
+  @Override
+  protected final void onSend() throws Exception {
+    if (TextSecurePreferences.getSignedPreKeyFailureCount(context) > 5) {
+      ApplicationDependencies.getJobManager().add(new RotateSignedPreKeyJob());
+      throw new TextSecureExpiredException("Too many signed prekey rotation failures");
+    }
+
+    onPushSend();
+  }
+
+  @Override
+  public void onRetry() {
+    super.onRetry();
+    Log.i(TAG, "onRetry()");
+
+    if (getRunAttempt() > 1) {
+      Log.i(TAG, "Scheduling service outage detection job.");
+      ApplicationDependencies.getJobManager().add(new ServiceOutageDetectionJob());
+    }
+  }
+
+  protected Optional<byte[]> getProfileKey(@NonNull Recipient recipient) {
+    if (!recipient.resolve().isSystemContact() && !recipient.resolve().isProfileSharing()) {
+      return Optional.absent();
+    }
+
+    return Optional.of(ProfileKeyUtil.getProfileKey(context));
+  }
+
+  protected SignalServiceAddress getPushAddress(@NonNull Recipient recipient) {
+    return RecipientUtil.toSignalServiceAddress(context, recipient);
+  }
+
+  protected List<SignalServiceAttachment> getAttachmentsFor(List<Attachment> parts) {
+    List<SignalServiceAttachment> attachments = new LinkedList<>();
+
+    for (final Attachment attachment : parts) {
+      SignalServiceAttachment converted = getAttachmentFor(attachment);
+      if (converted != null) {
+        attachments.add(converted);
+      }
+    }
+
+    return attachments;
+  }
+
+  protected SignalServiceAttachment getAttachmentFor(Attachment attachment) {
+    try {
+      if (attachment.getDataUri() == null || attachment.getSize() == 0) throw new IOException("Assertion failed, outgoing attachment has no data!");
+      InputStream is = PartAuthority.getAttachmentStream(context, attachment.getDataUri());
+      return SignalServiceAttachment.newStreamBuilder()
+                                    .withStream(is)
+                                    .withContentType(attachment.getContentType())
+                                    .withLength(attachment.getSize())
+                                    .withFileName(attachment.getFileName())
+                                    .withVoiceNote(attachment.isVoiceNote())
+                                    .withWidth(attachment.getWidth())
+                                    .withHeight(attachment.getHeight())
+                                    .withCaption(attachment.getCaption())
+                                    .withListener((total, progress) -> EventBus.getDefault().postSticky(new PartProgressEvent(attachment, PartProgressEvent.Type.NETWORK, total, progress)))
+                                    .build();
+    } catch (IOException ioe) {
+      Log.w(TAG, "Couldn't open attachment", ioe);
+    }
+    return null;
+  }
+
+  protected static JobManager.Chain createCompressingAndUploadAttachmentsChain(@NonNull JobManager jobManager, OutgoingMediaMessage message) {
+    List<Attachment> attachments = new LinkedList<>();
+
+    attachments.addAll(message.getAttachments());
+
+    attachments.addAll(Stream.of(message.getLinkPreviews())
+                             .map(LinkPreview::getThumbnail)
+                             .filter(Optional::isPresent)
+                             .map(Optional::get)
+                             .toList());
+
+    attachments.addAll(Stream.of(message.getSharedContacts())
+                             .map(Contact::getAvatar).withoutNulls()
+                             .map(Contact.Avatar::getAttachment).withoutNulls()
+                             .toList());
+
+    List<AttachmentCompressionJob> compressionJobs = Stream.of(attachments).map(a -> AttachmentCompressionJob.fromAttachment((DatabaseAttachment) a, false, -1)).toList();
+
+    List<AttachmentUploadJob> attachmentJobs = Stream.of(attachments).map(a -> new AttachmentUploadJob(((DatabaseAttachment) a).getAttachmentId())).toList();
+
+    return jobManager.startChain(compressionJobs)
+                     .then(attachmentJobs);
+  }
+
+  protected @NonNull List<SignalServiceAttachment> getAttachmentPointersFor(List<Attachment> attachments) {
+    return Stream.of(attachments).map(this::getAttachmentPointerFor).filter(a -> a != null).toList();
+  }
+
+  protected @Nullable SignalServiceAttachment getAttachmentPointerFor(Attachment attachment) {
+    if (TextUtils.isEmpty(attachment.getLocation())) {
+      Log.w(TAG, "empty content id");
+      return null;
+    }
+
+    if (TextUtils.isEmpty(attachment.getKey())) {
+      Log.w(TAG, "empty encrypted key");
+      return null;
+    }
+
+    try {
+      long   id  = Long.parseLong(attachment.getLocation());
+      byte[] key = Base64.decode(attachment.getKey());
+
+      return new SignalServiceAttachmentPointer(id,
+                                                attachment.getContentType(),
+                                                key,
+                                                Optional.of(Util.toIntExact(attachment.getSize())),
+                                                Optional.absent(),
+                                                attachment.getWidth(),
+                                                attachment.getHeight(),
+                                                Optional.fromNullable(attachment.getDigest()),
+                                                Optional.fromNullable(attachment.getFileName()),
+                                                attachment.isVoiceNote(),
+                                                Optional.fromNullable(attachment.getCaption()),
+                                                Optional.fromNullable(attachment.getBlurHash()).transform(BlurHash::getHash));
+    } catch (IOException | ArithmeticException e) {
+      Log.w(TAG, e);
+      return null;
+    }
+  }
+
+  protected static void notifyMediaMessageDeliveryFailed(Context context, long messageId) {
+    long      threadId  = DatabaseFactory.getMmsDatabase(context).getThreadIdForMessage(messageId);
+    Recipient recipient = DatabaseFactory.getThreadDatabase(context).getRecipientForThreadId(threadId);
+
+    if (threadId != -1 && recipient != null) {
+      MessageNotifier.notifyMessageDeliveryFailed(context, recipient, threadId);
+    }
+  }
+
+  protected Optional<SignalServiceDataMessage.Quote> getQuoteFor(OutgoingMediaMessage message) {
+    if (message.getOutgoingQuote() == null) return Optional.absent();
+
+    long                                                  quoteId             = message.getOutgoingQuote().getId();
+    String                                                quoteBody           = message.getOutgoingQuote().getText();
+    RecipientId                                           quoteAuthor         = message.getOutgoingQuote().getAuthor();
+    List<SignalServiceDataMessage.Quote.QuotedAttachment> quoteAttachments    = new LinkedList<>();
+    List<Attachment>                                      filteredAttachments = Stream.of(message.getOutgoingQuote().getAttachments())
+                                                                                      .filterNot(a -> MediaUtil.isViewOnceType(a.getContentType()))
+                                                                                      .toList();
+
+    for (Attachment attachment : filteredAttachments) {
+      BitmapUtil.ScaleResult  thumbnailData = null;
+      SignalServiceAttachment thumbnail     = null;
+      String                  thumbnailType = MediaUtil.IMAGE_JPEG;
+
+      try {
+        if (MediaUtil.isImageType(attachment.getContentType()) && attachment.getDataUri() != null) {
+          Bitmap.CompressFormat format = BitmapUtil.getCompressFormatForContentType(attachment.getContentType());
+
+          thumbnailData = BitmapUtil.createScaledBytes(context, new DecryptableStreamUriLoader.DecryptableUri(attachment.getDataUri()), 100, 100, 500 * 1024, format);
+          thumbnailType = attachment.getContentType();
+        } else if (MediaUtil.isVideoType(attachment.getContentType()) && attachment.getThumbnailUri() != null) {
+          thumbnailData = BitmapUtil.createScaledBytes(context, new DecryptableStreamUriLoader.DecryptableUri(attachment.getThumbnailUri()), 100, 100, 500 * 1024);
+        }
+
+        if (thumbnailData != null) {
+          thumbnail = SignalServiceAttachment.newStreamBuilder()
+                                             .withContentType(thumbnailType)
+                                             .withWidth(thumbnailData.getWidth())
+                                             .withHeight(thumbnailData.getHeight())
+                                             .withLength(thumbnailData.getBitmap().length)
+                                             .withStream(new ByteArrayInputStream(thumbnailData.getBitmap()))
+                                             .build();
+        }
+
+        quoteAttachments.add(new SignalServiceDataMessage.Quote.QuotedAttachment(attachment.getContentType(),
+                                                                                 attachment.getFileName(),
+                                                                                 thumbnail));
+      } catch (BitmapDecodingException e) {
+        Log.w(TAG, e);
+      }
+    }
+
+    Recipient            quoteAuthorRecipient = Recipient.resolved(quoteAuthor);
+    SignalServiceAddress quoteAddress         = RecipientUtil.toSignalServiceAddress(context, quoteAuthorRecipient);
+    return Optional.of(new SignalServiceDataMessage.Quote(quoteId, quoteAddress, quoteBody, quoteAttachments));
+  }
+
+  protected Optional<SignalServiceDataMessage.Sticker> getStickerFor(OutgoingMediaMessage message) {
+    Attachment stickerAttachment = Stream.of(message.getAttachments()).filter(Attachment::isSticker).findFirst().orElse(null);
+
+    if (stickerAttachment == null) {
+      return Optional.absent();
+    }
+
+    try {
+      byte[]                  packId     = Hex.fromStringCondensed(stickerAttachment.getSticker().getPackId());
+      byte[]                  packKey    = Hex.fromStringCondensed(stickerAttachment.getSticker().getPackKey());
+      int                     stickerId  = stickerAttachment.getSticker().getStickerId();
+      SignalServiceAttachment attachment = getAttachmentPointerFor(stickerAttachment);
+
+      return Optional.of(new SignalServiceDataMessage.Sticker(packId, packKey, stickerId, attachment));
+    } catch (IOException e) {
+      Log.w(TAG, "Failed to decode sticker id/key", e);
+      return Optional.absent();
+    }
+  }
+
+  List<SharedContact> getSharedContactsFor(OutgoingMediaMessage mediaMessage) {
+    List<SharedContact> sharedContacts = new LinkedList<>();
+
+    for (Contact contact : mediaMessage.getSharedContacts()) {
+      SharedContact.Builder builder = ContactModelMapper.localToRemoteBuilder(contact);
+      SharedContact.Avatar  avatar  = null;
+
+      if (contact.getAvatar() != null && contact.getAvatar().getAttachment() != null) {
+        avatar = SharedContact.Avatar.newBuilder().withAttachment(getAttachmentFor(contact.getAvatarAttachment()))
+                                                  .withProfileFlag(contact.getAvatar().isProfile())
+                                                  .build();
+      }
+
+      builder.setAvatar(avatar);
+      sharedContacts.add(builder.build());
+    }
+
+    return sharedContacts;
+  }
+
+  List<Preview> getPreviewsFor(OutgoingMediaMessage mediaMessage) {
+    return Stream.of(mediaMessage.getLinkPreviews()).map(lp -> {
+      SignalServiceAttachment attachment = lp.getThumbnail().isPresent() ? getAttachmentPointerFor(lp.getThumbnail().get()) : null;
+      return new Preview(lp.getUrl(), lp.getTitle(), Optional.fromNullable(attachment));
+    }).toList();
+  }
+
+  protected void rotateSenderCertificateIfNecessary() throws IOException {
+    try {
+      byte[] certificateBytes = TextSecurePreferences.getUnidentifiedAccessCertificate(context);
+
+      if (certificateBytes == null) {
+        throw new InvalidCertificateException("No certificate was present.");
+      }
+
+      SenderCertificate certificate = new SenderCertificate(certificateBytes);
+
+      if (System.currentTimeMillis() > (certificate.getExpiration() - CERTIFICATE_EXPIRATION_BUFFER)) {
+        throw new InvalidCertificateException("Certificate is expired, or close to it. Expires on: " + certificate.getExpiration() + ", currently: " + System.currentTimeMillis());
+      }
+
+      Log.d(TAG, "Certificate is valid.");
+    } catch (InvalidCertificateException e) {
+      Log.w(TAG, "Certificate was invalid at send time. Fetching a new one.", e);
+      RotateCertificateJob certificateJob = new RotateCertificateJob(context);
+      certificateJob.onRun();
+    }
+  }
+
+  protected SignalServiceSyncMessage buildSelfSendSyncMessage(@NonNull Context context, @NonNull SignalServiceDataMessage message, Optional<UnidentifiedAccessPair> syncAccess) {
+    SignalServiceAddress  localAddress = new SignalServiceAddress(TextSecurePreferences.getLocalUuid(context), TextSecurePreferences.getLocalNumber(context));
+    SentTranscriptMessage transcript   = new SentTranscriptMessage(Optional.of(localAddress),
+                                                                   message.getTimestamp(),
+                                                                   message,
+                                                                   message.getExpiresInSeconds(),
+                                                                   Collections.singletonMap(localAddress, syncAccess.isPresent()),
+                                                                   false);
+    return SignalServiceSyncMessage.forSentTranscript(transcript);
+  }
+
+
+  protected abstract void onPushSend() throws Exception;
+}
